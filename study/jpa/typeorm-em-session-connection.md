@@ -237,6 +237,8 @@ TypeORM의 EntityManager는 영속성 컨텍스트 없이 **QueryRunner에 위�
 
 ## 비교 요약
 
+### 이름 기준 대응 (혼동하기 쉬움)
+
 | JPA                            | TypeORM                        | 비고                                                       |
 | ------------------------------ | ------------------------------ | ---------------------------------------------------------- |
 | `EntityManagerFactory`         | `DataSource`                   | 앱 1개, 무거운 초기화                                      |
@@ -245,6 +247,45 @@ TypeORM의 EntityManager는 영속성 컨텍스트 없이 **QueryRunner에 위�
 | `Connection` (JDBC)            | `QueryRunner` 내부의 DB 커넥션 | 둘 다 풀에서 빌려서 사용                                   |
 | `ConnectionPool` (HikariCP 등) | `pg.Pool`, `mysql2.Pool` 등    | npm 패키지의 풀                                            |
 | `ThreadLocal` → Session 바인딩 | 해당 없음                      | Node.js는 싱글 쓰레드, 영속성 컨텍스트 없음                |
+
+### 역할 기준 대응 (실제 동작이 비슷한 것끼리)
+
+이름만 보면 JPA `EntityManager` = TypeORM `EntityManager`라고 생각하기 쉽지만,
+**실제 역할로 비교하면 JPA `EntityManager`는 TypeORM `QueryRunner`에 더 가깝다.**
+
+```
+이름 기준:                           역할 기준:
+JPA              TypeORM             JPA                    TypeORM
+───              ───────             ───                    ───────
+EMF          ←→  DataSource          EMF                ←→  DataSource
+EM (Session) ←→  EntityManager?      EM (Session)       ←→  QueryRunner
+                                     Repository (Spring) ←→  EntityManager
+```
+
+| 특성              | JPA EntityManager (Session)           | TypeORM QueryRunner                                                    |
+| ----------------- | ------------------------------------- | ---------------------------------------------------------------------- |
+| **생성 시점**     | 작업(요청)마다 새로 생성              | 쿼리/트랜잭션마다 새로 생성                                            |
+| **커넥션 보유**   | 풀에서 커넥션을 빌려 고정             | 풀에서 커넥션을 빌려 고정                                              |
+| **트랜잭션 관리** | `begin()` / `commit()` / `rollback()` | `startTransaction()` / `commitTransaction()` / `rollbackTransaction()` |
+| **수명**          | 작업 끝나면 `close()`                 | 작업 끝나면 `release()`                                                |
+| **재사용**        | 안 함 (닫으면 끝)                     | 안 함 (release하면 끝)                                                 |
+
+차이는 **영속성 컨텍스트의 유무**다:
+
+```
+JPA EntityManager = QueryRunner + 영속성 컨텍스트
+                    ^^^^^^^^^^   ^^^^^^^^^^^^^^^^^^
+                    커넥션 관리    1차 캐시, 쓰기 지연, dirty checking
+                    트랜잭션 관리
+
+TypeORM QueryRunner = 커넥션 관리 + 트랜잭션 관리 (영속성 컨텍스트 없음)
+```
+
+JPA의 EntityManager에서 영속성 컨텍스트를 빼면 TypeORM의 QueryRunner가 된다.
+"커넥션 1개를 붙잡고 그 위에서 작업 단위를 실행한다"는 핵심은 동일하다.
+
+반면 TypeORM의 `EntityManager`는 이름과 달리 JPA의 EM보다 **Spring의 Repository**에 가깝다.
+둘 다 stateless하고 앱 전체에서 재사용되며, 내부적으로 실제 작업 주체에 위임하기 때문이다.
 
 ### TypeORM의 EntityManagerFactory는 이름만 같다
 
