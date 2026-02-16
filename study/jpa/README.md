@@ -12,3 +12,4 @@ JPA 개발자 관점에서 TypeORM 내부 동작을 분석하고 비교한 학�
 | [typeorm-bootstrap.md](./typeorm-bootstrap.md)                             | 구동 방식 비교 (persistence.xml/EMF/EM vs DataSource/initialize)                             |
 | [typeorm-em-session-connection.md](./typeorm-em-session-connection.md)     | EntityManager, Session, Connection의 관계 (Thread/ThreadLocal 포함)                          |
 | [typeorm-query-language.md](./typeorm-query-language.md)                   | JPQL vs TypeORM 쿼리 방식 (Find API, QueryBuilder, Raw SQL)                                  |
+| [typeorm-primary-key.md](./typeorm-primary-key.md)                         | 기본 키 매핑과 생성 전략 (SEQUENCE 부재, INSERT 전 ID 확보, Outbox 패턴)                     |
