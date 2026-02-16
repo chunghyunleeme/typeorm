@@ -49,7 +49,7 @@ EMF.createEntityManager() → EntityManager 생성
   └─ 영속성 컨텍스트 생성 (1차 캐시, 쓰기 지연 저장소, 스냅샷)
   │
   ▼
-Transaction 시작
+Transaction 시작 ← 자동이 아님! (아래 참고)
   │
   ▼
 em.find(User.class, 1L)
@@ -73,6 +73,33 @@ Transaction commit
   ├─ DB commit
   └─ EntityManager close → 영속성 컨텍스트 소멸
 ```
+
+**트랜잭션은 자동이 아니다.** 위 흐름에서 EM 생성, 트랜잭션 시작/커밋, EM 닫기는 모두 수동이다.
+
+순수 JPA에서는 개발자가 직접 관리해야 한다:
+
+```java
+EntityManager em = emf.createEntityManager();
+EntityTransaction tx = em.getTransaction();
+tx.begin();          // 직접 시작
+// ... 작업 ...
+tx.commit();         // 직접 커밋
+em.close();          // 직접 닫기
+```
+
+Spring의 `@Transactional`이 이 보일러플레이트를 자동화해주는 것이다:
+
+```java
+@Transactional   // Spring AOP가 begin, commit/rollback, close를 대신 처리
+public void updateUser(Long id) {
+    User user = em.find(User.class, id);
+    user.setName("Tom");
+    // 메서드 끝 → 자동 flush + commit + EM close
+}
+```
+
+"요청 1개 = 트랜잭션 1개"는 JPA 스펙이 아니라 **Spring `@Transactional`의 편의 기능**이다.
+하나의 요청 안에서 트랜잭션을 여러 개 만들 수도 있다 (`REQUIRES_NEW` 등).
 
 ### TypeORM에서 같은 흐름
 
