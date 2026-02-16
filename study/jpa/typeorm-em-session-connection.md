@@ -284,3 +284,119 @@ TypeORM:
   싱글 쓰레드 → EntityManager 1개 (상태 없음)
   → 격리할 상태 자체가 없음
 ```
+
+---
+
+## QueryRunner와 트랜잭션
+
+### 트랜잭션은 커넥션 단위
+
+DB 트랜잭션은 하나의 커넥션 위에서 돌아야 한다. `START TRANSACTION`과 `COMMIT`이 같은 TCP 연결에서 실행되어야 한다.
+TypeORM에서 이를 보장하는 것이 **QueryRunner**다.
+
+### QueryRunner의 구조
+
+```
+QueryRunner
+  ├─ databaseConnection  ← 커넥션 풀에서 빌린 커넥션 1개 (고정)
+  ├─ isTransactionActive ← 트랜잭션 진행 중인지
+  ├─ transactionDepth    ← 중첩 트랜잭션 깊이
+  │
+  ├─ connect()           → 커넥션 빌리기 (최초 1회, 이후 재사용)
+  ├─ query(sql)          → this.databaseConnection으로 SQL 실행
+  ├─ startTransaction()  → "START TRANSACTION" 실행
+  ├─ commitTransaction() → "COMMIT" 실행
+  ├─ rollbackTransaction()→ "ROLLBACK" 실행
+  └─ release()           → 커넥션을 풀에 반환
+```
+
+### 같은 커넥션을 재사용하는 코드 근거
+
+`connect()` — 최초에만 빌리고 이후 재사용 (`src/driver/postgres/PostgresQueryRunner.ts:82`):
+
+```typescript
+connect() {
+    if (this.databaseConnection)       // 이미 빌렸으면 같은 커넥션 재사용
+        return this.databaseConnection
+
+    // 최초에만 풀에서 빌림
+    this.databaseConnectionPromise = this.driver.obtainMasterConnection()
+        .then(([connection, release]) => {
+            this.databaseConnection = connection  // 저장해두고 계속 사용
+            this.releaseCallback = release         // 반납 함수 저장
+        })
+}
+```
+
+`startTransaction()` / `commitTransaction()` (`src/driver/postgres/PostgresQueryRunner.ts:170-213`):
+
+```typescript
+async startTransaction() {
+    await this.query("START TRANSACTION")  // this.query → 같은 커넥션
+}
+async commitTransaction() {
+    await this.query("COMMIT")             // this.query → 같은 커넥션
+}
+```
+
+모두 `this.query()`를 거치고, `this.query()`는 항상 `this.databaseConnection`(같은 커넥션)을 사용한다.
+
+### 트랜잭션 실행 흐름
+
+`dataSource.transaction()` 내부 (`src/entity-manager/EntityManager.ts:154-160`):
+
+```typescript
+async transaction(runInTransaction) {
+    const queryRunner = this.connection.createQueryRunner()  // 커넥션 1개 확보
+
+    await queryRunner.startTransaction()                         // START TRANSACTION
+    const result = await runInTransaction(queryRunner.manager)   // 사용자 쿼리들
+    await queryRunner.commitTransaction()                        // COMMIT
+
+    await queryRunner.release()                                  // 커넥션 반환
+}
+```
+
+사용자 코드:
+
+```typescript
+await dataSource.transaction(async (manager) => {
+    await manager.save(user1) // ┐
+    await manager.save(user2) // ├─ 전부 같은 QueryRunner → 같은 커넥션
+    await manager.remove(user3) // ┘
+})
+```
+
+```
+커넥션 풀: [conn1, conn2, conn3, ...]
+                    │
+                    ▼ (빌림)
+QueryRunner ─── conn2 (고정)
+  │
+  ├─ "START TRANSACTION"     ← conn2
+  ├─ "INSERT INTO user ..."  ← conn2
+  ├─ "INSERT INTO user ..."  ← conn2
+  ├─ "DELETE FROM user ..."  ← conn2
+  ├─ "COMMIT"                ← conn2
+  │
+  └─ release()               → conn2를 풀에 반환
+```
+
+### 트랜잭션 없이 save()를 호출하면
+
+```typescript
+await repo.save(user1) // QueryRunner A → conn1 빌림 → INSERT → commit → conn1 반환
+await repo.save(user2) // QueryRunner B → conn2 빌림 → INSERT → commit → conn2 반환
+```
+
+각 `save()`가 **별도의 QueryRunner = 별도의 커넥션 = 별도의 트랜잭션**이다.
+첫 번째가 성공하고 두 번째가 실패해도 첫 번째는 이미 커밋된 상태다.
+
+### JPA와 비교
+
+|                      | JPA                                                 | TypeORM                                                          |
+| -------------------- | --------------------------------------------------- | ---------------------------------------------------------------- |
+| **커넥션 관리 주체** | Session이 내부적으로 관리                           | QueryRunner가 관리                                               |
+| **같은 커넥션 보장** | Session이 보장                                      | QueryRunner가 `databaseConnection` 고정으로 보장                 |
+| **트랜잭션 시작**    | `em.getTransaction().begin()` 또는 `@Transactional` | `queryRunner.startTransaction()` 또는 `dataSource.transaction()` |
+| **자동 트랜잭션**    | Spring `@Transactional`이 자동화                    | `save()` 하나당 자동 또는 `transaction()` 수동                   |
