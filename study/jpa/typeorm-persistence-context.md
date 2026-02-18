@@ -30,7 +30,7 @@ await dataSource.transaction(async (manager) => {
     const user1 = await manager.findOne(User, { where: { id: 1 } })
     const user2 = await manager.findOne(User, { where: { id: 1 } })
 
-    console.log(user1 === user2)  // false — 다른 객체
+    console.log(user1 === user2) // false — 다른 객체
 })
 ```
 
@@ -92,10 +92,10 @@ tx.commit();          // 이 시점에 INSERT 2개 + UPDATE 1개 한꺼번에 fl
 ### TypeORM: save() 호출 즉시 실행
 
 ```typescript
-await manager.save(user1)   // 즉시 INSERT 실행 + commit
-await manager.save(user2)   // 즉시 INSERT 실행 + commit
+await manager.save(user1) // 즉시 INSERT 실행 + commit
+await manager.save(user2) // 즉시 INSERT 실행 + commit
 user1.name = "Tom"
-await manager.save(user1)   // 즉시 UPDATE 실행 + commit
+await manager.save(user1) // 즉시 UPDATE 실행 + commit
 ```
 
 #### 코드 근거
@@ -142,13 +142,13 @@ async execute() {
 ```typescript
 // 방법 1: transaction 블록
 await dataSource.transaction(async (manager) => {
-    await manager.save(user1)    // INSERT — 커밋은 아직
-    await manager.save(user2)    // INSERT — 커밋은 아직
+    await manager.save(user1) // INSERT — 커밋은 아직
+    await manager.save(user2) // INSERT — 커밋은 아직
     // 블록 끝에서 commit
 })
 
 // 방법 2: 배열로 한번에
-await manager.save([user1, user2])   // 하나의 트랜잭션에서 INSERT 2개
+await manager.save([user1, user2]) // 하나의 트랜잭션에서 INSERT 2개
 ```
 
 하지만 이것은 JPA의 쓰기 지연과 다르다.
@@ -174,7 +174,7 @@ flush 시점에 현재 상태와 비교하여 변경된 필드만 UPDATE한다.
 ```typescript
 const user = await manager.findOne(User, { where: { id: 1 } })
 user.name = "Tom"
-await manager.save(user)   // 이 안에서 DB에서 다시 조회하여 비교
+await manager.save(user) // 이 안에서 DB에서 다시 조회하여 비교
 ```
 
 `EntityPersistExecutor.execute()` 안에서:
@@ -189,28 +189,133 @@ TypeORM은 메모리에 스냅샷을 유지하지 않으므로, `save()` 호출 
 
 ---
 
+## 4. AsyncLocalStorage로 영속성 컨텍스트를 구현할 수 있는가?
+
+### 아이디어
+
+JPA는 `ThreadLocal`로 요청별 영속성 컨텍스트를 바인딩한다.
+Node.js에는 `AsyncLocalStorage`(ThreadLocal의 Node.js 대응)가 있으므로, 같은 구조를 만들 수 있다.
+
+```
+JPA:
+  Thread → ThreadLocal → EntityManager → 영속성 컨텍스트
+
+Node.js에서 같은 구조:
+  Request → AsyncLocalStorage → 커스텀 Context → Identity Map, 쓰기 지연 큐
+```
+
+```typescript
+// 가상의 구현
+import { AsyncLocalStorage } from "async_hooks"
+
+const als = new AsyncLocalStorage<PersistenceContext>()
+
+// 요청마다 새 컨텍스트 생성
+app.use((req, res, next) => {
+    als.run(new PersistenceContext(), next)
+})
+
+// findOne() — Identity Map 먼저 확인
+async findOne(User, id) {
+    const ctx = als.getStore()
+    const cached = ctx.identityMap.get(User, id)
+    if (cached) return cached          // DB 안 감
+
+    const entity = await queryDB(...)
+    ctx.identityMap.set(User, id, entity)
+    return entity
+}
+
+// save() — 즉시 실행 대신 큐에 모음
+async save(entity) {
+    const ctx = als.getStore()
+    ctx.writeQueue.push(entity)        // 쓰기 지연
+}
+
+// flush — 한꺼번에 실행
+async flush() {
+    const ctx = als.getStore()
+    await executeBatch(ctx.writeQueue)  // dirty checking + batch SQL
+}
+```
+
+### 실제로 이렇게 만든 ORM: MikroORM
+
+MikroORM은 **Node.js에서 JPA의 영속성 컨텍스트를 실제로 구현한 ORM**이다.
+
+```typescript
+// MikroORM — JPA와 거의 같은 패턴
+const em = orm.em.fork() // 요청마다 새 EntityManager
+
+const user1 = await em.findOne(User, 1)
+const user2 = await em.findOne(User, 1)
+console.log(user1 === user2) // true — Identity Map 동작!
+
+user1.name = "Tom"
+// save() 호출 안 해도 됨 — dirty checking이 자동 감지
+
+await em.flush() // 이 시점에 UPDATE 실행 (쓰기 지연)
+```
+
+MikroORM의 `RequestContext`가 내부적으로 AsyncLocalStorage를 사용한다:
+
+```typescript
+// MikroORM의 미들웨어
+app.use((req, res, next) => {
+    RequestContext.create(orm.em, next) // AsyncLocalStorage.run() 내부 호출
+})
+```
+
+### TypeORM에 추가하기 어려운 이유
+
+기술적으로 AsyncLocalStorage를 쓰면 가능하지만, TypeORM의 **전체 설계를 바꿔야** 한다:
+
+| 구성 요소          | 현재 TypeORM                | 영속성 컨텍스트 추가 시 |
+| ------------------ | --------------------------- | ----------------------- |
+| **EntityManager**  | stateless, 앱에 1개         | stateful, 요청마다 생성 |
+| **findOne()**      | 항상 SQL 실행               | Identity Map 먼저 확인  |
+| **save()**         | 즉시 INSERT/UPDATE          | 쓰기 지연 큐에 추가     |
+| **dirty checking** | save() 때 DB 재조회 후 비교 | 스냅샷과 자동 비교      |
+| **flush**          | 개념 없음                   | 큐의 SQL 일괄 실행      |
+
+EntityManager가 stateless라는 것이 TypeORM의 근본 설계이므로, 영속성 컨텍스트를 "추가"하는 것이 아니라 사실상 **다른 ORM을 만드는 것**에 가깝다.
+
+### Node.js ORM 비교: 영속성 컨텍스트 기준
+
+|                            | JPA (Hibernate)  | MikroORM          | TypeORM             |
+| -------------------------- | ---------------- | ----------------- | ------------------- |
+| **요청별 컨텍스트 바인딩** | ThreadLocal      | AsyncLocalStorage | 없음                |
+| **Identity Map**           | 있음             | 있음              | 없음                |
+| **쓰기 지연**              | 있음             | 있음              | 없음                |
+| **dirty checking**         | 스냅샷 자동 비교 | 스냅샷 자동 비교  | save() 때 DB 재조회 |
+| **flush**                  | 있음             | 있음              | 없음                |
+
+**결론:** AsyncLocalStorage라는 도구는 맞지만, TypeORM의 핵심 설계(stateless EntityManager)를 전면 수정해야 한다. 영속성 컨텍스트가 필요하면 MikroORM이 Node.js에서 가장 가까운 선택지다.
+
+---
+
 ## 비교 요약
 
-| | JPA (Hibernate) | TypeORM |
-|---|---|---|
-| **영속성 컨텍스트** | 있음 (EntityManager = 1차 캐시) | 없음 |
-| **Identity Map** | 같은 트랜잭션에서 동일 PK → 같은 객체 | 매번 새 객체 |
-| **2차 조회 시 SQL** | 실행 안 함 (캐시 히트) | 매번 실행 |
-| **쓰기 지연** | 있음 — flush 시점에 일괄 실행 | 없음 — `save()` 즉시 실행 |
-| **flush** | `commit()`, `flush()`, JPQL 실행 전 | 개념 없음 (`save()` = 즉시 flush) |
-| **batch insert** | flush 시 모아서 batch 가능 | `save([...])` 배열로 넘기면 한 트랜잭션 처리 |
-| **dirty checking** | 자동 — 스냅샷 비교 | `save()` 때 DB 재조회 후 비교 |
-| **변경 감지 트리거** | `commit()` / `flush()` 자동 | `save()` 명시적 호출 필수 |
-| **Query Result Cache** | 2차 캐시 (선택적) | `cache()` 옵션 (쿼리 결과 캐싱, Identity Map 아님) |
+|                        | JPA (Hibernate)                       | TypeORM                                            |
+| ---------------------- | ------------------------------------- | -------------------------------------------------- |
+| **영속성 컨텍스트**    | 있음 (EntityManager = 1차 캐시)       | 없음                                               |
+| **Identity Map**       | 같은 트랜잭션에서 동일 PK → 같은 객체 | 매번 새 객체                                       |
+| **2차 조회 시 SQL**    | 실행 안 함 (캐시 히트)                | 매번 실행                                          |
+| **쓰기 지연**          | 있음 — flush 시점에 일괄 실행         | 없음 — `save()` 즉시 실행                          |
+| **flush**              | `commit()`, `flush()`, JPQL 실행 전   | 개념 없음 (`save()` = 즉시 flush)                  |
+| **batch insert**       | flush 시 모아서 batch 가능            | `save([...])` 배열로 넘기면 한 트랜잭션 처리       |
+| **dirty checking**     | 자동 — 스냅샷 비교                    | `save()` 때 DB 재조회 후 비교                      |
+| **변경 감지 트리거**   | `commit()` / `flush()` 자동           | `save()` 명시적 호출 필수                          |
+| **Query Result Cache** | 2차 캐시 (선택적)                     | `cache()` 옵션 (쿼리 결과 캐싱, Identity Map 아님) |
 
 ---
 
 ## 관련 소스 파일
 
-| 파일 | 역할 |
-|---|---|
-| `src/entity-manager/EntityManager.ts` | `save()`, `findOne()` 등 진입점 |
-| `src/persistence/EntityPersistExecutor.ts` | `save()` 실행 — Subject 수집, 트랜잭션, 즉시 실행 |
-| `src/persistence/SubjectExecutor.ts` | INSERT/UPDATE/DELETE 순서대로 즉시 실행 |
-| `src/persistence/SubjectDatabaseEntityLoader.ts` | `save()` 시 DB에서 기존 상태 재조회 (dirty checking 대체) |
-| `src/query-builder/transformer/RawSqlResultsToEntityTransformer.ts` | 조회 시 매번 `metadata.create()` → 새 인스턴스 |
+| 파일                                                                | 역할                                                      |
+| ------------------------------------------------------------------- | --------------------------------------------------------- |
+| `src/entity-manager/EntityManager.ts`                               | `save()`, `findOne()` 등 진입점                           |
+| `src/persistence/EntityPersistExecutor.ts`                          | `save()` 실행 — Subject 수집, 트랜잭션, 즉시 실행         |
+| `src/persistence/SubjectExecutor.ts`                                | INSERT/UPDATE/DELETE 순서대로 즉시 실행                   |
+| `src/persistence/SubjectDatabaseEntityLoader.ts`                    | `save()` 시 DB에서 기존 상태 재조회 (dirty checking 대체) |
+| `src/query-builder/transformer/RawSqlResultsToEntityTransformer.ts` | 조회 시 매번 `metadata.create()` → 새 인스턴스            |
